@@ -1,89 +1,125 @@
 #!/usr/bin/env node
 
 /**
- * Orchid Care Guide Content Generator
+ * Orchid Care Guide Content Generator with RAG
  *
- * This script reads the orchids-list.md file and generates detailed care information
- * for each orchid species using LangChain and Ollama.
+ * This script generates detailed care information for each orchid species using
+ * Retrieval-Augmented Generation (RAG) with LangChain, Qdrant, and Ollama.
  *
- * Prerequisites:
- * - Ollama running locally (ollama serve)
- * - At least one model installed (e.g., ollama pull llama3.2)
+ * It retrieves relevant information from the vector database and uses it to
+ * generate accurate, evidence-based care guides.
  */
 
 const fs = require('fs').promises;
 const path = require('path');
+const { QdrantClient } = require('@qdrant/js-client-rest');
+const { OllamaEmbeddings } = require('@langchain/ollama');
+const { Ollama } = require('@langchain/ollama');
+const { PromptTemplate } = require('@langchain/core/prompts');
 
 // Configuration
+require('dotenv').config();
 const ORCHIDS_LIST_PATH = path.join(__dirname, '../data/orchids-list.md');
 const OUTPUT_DIR = path.join(__dirname, '../data/orchids');
+const RESOURCES_DIR = path.join(__dirname, '../data/resources');
+const QDRANT_URL = process.env.QDRANT_URL || 'http://localhost:6333';
+const QDRANT_COLLECTION = process.env.QDRANT_COLLECTION || 'orchid_care_resources';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2';
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'nomic-embed-text';
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
 
+let qdrantClient;
+let embeddings;
+let llm;
+
 /**
- * Parse the orchids-list.md file to extract orchid species
+ * Initialize clients
  */
-async function parseOrchidsList() {
+async function initialize() {
+  console.log('Initializing Qdrant client...');
+  qdrantClient = new QdrantClient({ url: QDRANT_URL });
+
+  console.log('Initializing Ollama embeddings...');
+  embeddings = new OllamaEmbeddings({
+    model: EMBEDDING_MODEL,
+    baseUrl: OLLAMA_BASE_URL,
+  });
+
+  console.log('Initializing Ollama LLM...');
+  llm = new Ollama({
+    model: OLLAMA_MODEL,
+    baseUrl: OLLAMA_BASE_URL,
+    temperature: 0.7,
+  });
+
+  // Test connections
   try {
-    const content = await fs.readFile(ORCHIDS_LIST_PATH, 'utf-8');
-    const lines = content.split('\n');
-    const orchids = [];
-
-    let currentOrchid = null;
-
-    for (const line of lines) {
-      // Match orchid entries: ### Name (*Scientific Name*)
-      const orchidMatch = line.match(/^###\s+(.+?)\s+\(([^)]+)\)/);
-      if (orchidMatch) {
-        if (currentOrchid) {
-          orchids.push(currentOrchid);
-        }
-
-        const commonName = orchidMatch[1].trim();
-        const scientificName = orchidMatch[2].replace(/\*/g, '').trim();
-
-        currentOrchid = {
-          name: commonName,
-          scientificName: scientificName,
-          slug: generateSlug(commonName),
-          customVideos: [],
-          customWebsites: [],
-          description: ''
-        };
-      }
-      // Match custom videos
-      else if (line.match(/^-\s+Videos?:/i) && currentOrchid) {
-        const urls = line.split(':')[1].split(',').map(u => u.trim()).filter(u => u);
-        currentOrchid.customVideos.push(...urls);
-      }
-      // Match custom websites
-      else if (line.match(/^-\s+Websites?:/i) && currentOrchid) {
-        const urls = line.split(':')[1].split(',').map(u => u.trim()).filter(u => u);
-        currentOrchid.customWebsites.push(...urls);
-      }
-      // Collect description (non-empty lines that aren't headers or lists)
-      else if (currentOrchid && line.trim() && !line.startsWith('#') && !line.startsWith('-') && !line.startsWith('*')) {
-        if (currentOrchid.description) {
-          currentOrchid.description += ' ';
-        }
-        currentOrchid.description += line.trim();
-      }
-    }
-
-    if (currentOrchid) {
-      orchids.push(currentOrchid);
-    }
-
-    return orchids;
+    await qdrantClient.getCollections();
+    console.log('✓ Connected to Qdrant');
   } catch (error) {
-    console.error('Error parsing orchids list:', error.message);
+    console.error('✗ Could not connect to Qdrant');
+    throw error;
+  }
+
+  try {
+    await embeddings.embedQuery('test');
+    console.log(`✓ Ollama embeddings ready (${EMBEDDING_MODEL})`);
+  } catch (error) {
+    console.error(`✗ Could not connect to Ollama embeddings`);
+    console.error(`  Run: ollama pull ${EMBEDDING_MODEL}`);
+    throw error;
+  }
+
+  try {
+    await llm.invoke('test');
+    console.log(`✓ Ollama LLM ready (${OLLAMA_MODEL})`);
+  } catch (error) {
+    console.error(`✗ Could not connect to Ollama LLM`);
+    console.error(`  Run: ollama pull ${OLLAMA_MODEL}`);
     throw error;
   }
 }
 
 /**
- * Generate a URL-friendly slug from a name
+ * Parse the orchids-list.md file
  */
+async function parseOrchidsList() {
+  const content = await fs.readFile(ORCHIDS_LIST_PATH, 'utf-8');
+  const lines = content.split('\n');
+  const orchids = [];
+  let currentOrchid = null;
+
+  for (const line of lines) {
+    const orchidMatch = line.match(/^###\s+(.+?)\s+\(([^)]+)\)/);
+    if (orchidMatch) {
+      if (currentOrchid) {
+        orchids.push(currentOrchid);
+      }
+
+      const commonName = orchidMatch[1].trim();
+      const scientificName = orchidMatch[2].replace(/\*/g, '').trim();
+
+      currentOrchid = {
+        name: commonName,
+        scientificName: scientificName,
+        slug: generateSlug(commonName),
+        description: ''
+      };
+    } else if (currentOrchid && line.trim() && !line.startsWith('#') && !line.startsWith('-') && !line.startsWith('*')) {
+      if (currentOrchid.description) {
+        currentOrchid.description += ' ';
+      }
+      currentOrchid.description += line.trim();
+    }
+  }
+
+  if (currentOrchid) {
+    orchids.push(currentOrchid);
+  }
+
+  return orchids;
+}
+
 function generateSlug(name) {
   return name
     .toLowerCase()
@@ -92,64 +128,161 @@ function generateSlug(name) {
 }
 
 /**
- * Call Ollama API to generate care information
+ * Retrieve relevant information from Qdrant for an orchid
  */
-async function generateCareInfo(orchid) {
-  const prompt = `You are an expert orchid grower. Provide detailed care information for ${orchid.name} (${orchid.scientificName}).
-
-Please provide specific care requirements in the following categories. Be concise but informative (2-3 sentences per category):
-
-1. Light: Describe the ideal lighting conditions
-2. Water: Explain watering frequency and methods
-3. Temperature: Specify ideal temperature ranges
-4. Humidity: Detail humidity requirements
-5. Fertilizer: Describe fertilization schedule and type
-6. Potting: Explain potting medium and repotting guidance
-7. Blooming: Describe blooming season and tips
-
-Format your response as valid JSON with this exact structure:
-{
-  "light": "your detailed answer here",
-  "water": "your detailed answer here",
-  "temperature": "your detailed answer here",
-  "humidity": "your detailed answer here",
-  "fertilizer": "your detailed answer here",
-  "potting": "your detailed answer here",
-  "blooming": "your detailed answer here"
-}
-
-Only return the JSON object, no other text.`;
-
+async function retrieveOrchidInfo(orchid, query, limit = 10) {
   try {
-    console.log(`  Generating care info with Ollama (${OLLAMA_MODEL})...`);
+    // Generate query embedding
+    const queryEmbedding = await embeddings.embedQuery(query);
 
-    const response = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
+    // Search in Qdrant with filter for specific orchid
+    const searchResults = await qdrantClient.search(QDRANT_COLLECTION, {
+      vector: queryEmbedding,
+      limit: limit,
+      filter: {
+        must: [
+          {
+            key: 'orchidSlug',
+            match: { value: orchid.slug }
+          }
+        ]
       },
-      body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        prompt: prompt,
-        stream: false,
-        format: 'json'
-      }),
+      with_payload: true,
     });
 
-    if (!response.ok) {
-      throw new Error(`Ollama API error: ${response.statusText}`);
+    return searchResults.map(result => ({
+      content: result.payload.content,
+      score: result.score,
+      source: result.payload.resourceUrl,
+      title: result.payload.resourceTitle,
+      type: result.payload.resourceType,
+      priority: result.payload.priority
+    }));
+  } catch (error) {
+    console.error(`    Error retrieving info: ${error.message}`);
+    return [];
+  }
+}
+
+/**
+ * Generate care information using RAG
+ */
+async function generateCareInfoWithRAG(orchid) {
+  console.log(`  Generating care information with RAG...`);
+
+  // Retrieve relevant information for different care aspects
+  const queries = [
+    `${orchid.name} ${orchid.scientificName} light requirements lighting conditions`,
+    `${orchid.name} ${orchid.scientificName} watering schedule water frequency`,
+    `${orchid.name} ${orchid.scientificName} temperature requirements`,
+    `${orchid.name} ${orchid.scientificName} humidity requirements`,
+    `${orchid.name} ${orchid.scientificName} fertilizer feeding schedule`,
+    `${orchid.name} ${orchid.scientificName} potting medium repotting`,
+    `${orchid.name} ${orchid.scientificName} blooming flowering tips`
+  ];
+
+  console.log(`    Retrieving information from vector database...`);
+  const allRetrievedInfo = [];
+
+  for (const query of queries) {
+    const results = await retrieveOrchidInfo(orchid, query, 5);
+    allRetrievedInfo.push(...results);
+  }
+
+  // Remove duplicates based on content
+  const uniqueInfo = allRetrievedInfo.filter((item, index, self) =>
+    index === self.findIndex(t => t.content === item.content)
+  );
+
+  console.log(`    Retrieved ${uniqueInfo.length} unique information chunks`);
+
+  if (uniqueInfo.length === 0) {
+    console.log(`    ⚠ No information found in vector database`);
+    console.log(`    Using fallback information...`);
+    return generateFallbackCareInfo(orchid);
+  }
+
+  // Prepare context from retrieved information
+  const context = uniqueInfo
+    .map((info, i) => `[Source ${i + 1} - ${info.type} - ${info.title}]:\n${info.content}`)
+    .join('\n\n');
+
+  // Create prompt template
+  const promptTemplate = PromptTemplate.fromTemplate(`You are an expert orchid grower. Based on the following information retrieved from trusted sources about {orchidName} ({scientificName}), provide detailed care requirements.
+
+IMPORTANT: Base your response ONLY on the information provided in the sources below. Do not make up information.
+
+Retrieved Information:
+{context}
+
+Please provide care requirements in the following categories (2-3 sentences each). If information for a category is not available in the sources, say "Information not available in sources" for that category:
+
+1. Light
+2. Water
+3. Temperature
+4. Humidity
+5. Fertilizer
+6. Potting
+7. Blooming
+
+Format your response as valid JSON with this exact structure:
+{{
+  "light": "your answer here",
+  "water": "your answer here",
+  "temperature": "your answer here",
+  "humidity": "your answer here",
+  "fertilizer": "your answer here",
+  "potting": "your answer here",
+  "blooming": "your answer here"
+}}
+
+Only return the JSON object, no other text.`);
+
+  const prompt = await promptTemplate.format({
+    orchidName: orchid.name,
+    scientificName: orchid.scientificName,
+    context: context
+  });
+
+  // Generate response
+  console.log(`    Generating care guide with ${OLLAMA_MODEL}...`);
+  const response = await llm.invoke(prompt);
+
+  try {
+    // Extract JSON from response
+    const jsonMatch = response.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      throw new Error('No JSON found in response');
     }
 
-    const data = await response.json();
-    const careInfo = JSON.parse(data.response);
+    const careInfo = JSON.parse(jsonMatch[0]);
 
-    return careInfo;
+    // Add source information
+    const sources = uniqueInfo
+      .filter((info, index, self) =>
+        index === self.findIndex(t => t.source === info.source)
+      )
+      .map(info => ({
+        url: info.source,
+        title: info.title,
+        type: info.type,
+        priority: info.priority
+      }));
+
+    return { careInfo, sources };
   } catch (error) {
-    console.error(`  Error generating care info: ${error.message}`);
-    console.log('  Using fallback care information...');
+    console.error(`    Error parsing LLM response: ${error.message}`);
+    console.log(`    Using fallback information...`);
+    return generateFallbackCareInfo(orchid);
+  }
+}
 
-    // Fallback care information
-    return {
+/**
+ * Generate fallback care information
+ */
+function generateFallbackCareInfo(orchid) {
+  return {
+    careInfo: {
       light: 'Bright, indirect light is generally preferred. Adjust based on specific species requirements.',
       water: 'Water when the potting medium is nearly dry. Frequency varies by species and environment.',
       temperature: 'Most orchids prefer temperatures between 60-80°F (15-27°C).',
@@ -157,70 +290,65 @@ Only return the JSON object, no other text.`;
       fertilizer: 'Feed regularly during growing season with diluted orchid fertilizer.',
       potting: 'Use well-draining orchid mix. Repot when medium breaks down or plant outgrows pot.',
       blooming: 'Blooming depends on species. Provide proper care and environmental conditions.'
+    },
+    sources: []
+  };
+}
+
+/**
+ * Load resources metadata
+ */
+async function loadResourcesMetadata(orchid) {
+  try {
+    const resourcePath = path.join(RESOURCES_DIR, `${orchid.slug}.json`);
+    const data = JSON.parse(await fs.readFile(resourcePath, 'utf-8'));
+
+    const resources = {
+      videos: [],
+      websites: []
     };
+
+    if (data.resources) {
+      for (const resource of data.resources) {
+        if (resource.type === 'youtube') {
+          resources.videos.push({
+            url: resource.url,
+            title: resource.title
+          });
+        } else if (resource.type === 'website') {
+          resources.websites.push({
+            url: resource.url,
+            title: resource.title
+          });
+        }
+      }
+    }
+
+    return resources;
+  } catch (error) {
+    return { videos: [], websites: [] };
   }
 }
 
 /**
- * Generate suggested search queries for finding resources
- */
-function generateSearchQueries(orchid) {
-  return {
-    videos: [
-      `${orchid.name} ${orchid.scientificName} care guide`,
-      `how to grow ${orchid.name} orchid`,
-      `${orchid.scientificName} watering and care`
-    ],
-    websites: [
-      `${orchid.name} care guide`,
-      `${orchid.scientificName} growing tips`,
-      `${orchid.name} orchid maintenance`
-    ]
-  };
-}
-
-/**
- * Process a single orchid and generate its care guide
+ * Process a single orchid
  */
 async function processOrchid(orchid) {
   console.log(`\nProcessing: ${orchid.name} (${orchid.scientificName})`);
 
-  // Generate care information using Ollama
-  const careInfo = await generateCareInfo(orchid);
+  // Generate care information using RAG
+  const { careInfo, sources } = await generateCareInfoWithRAG(orchid);
 
-  // Prepare resources
-  const resources = {
-    videos: [],
-    websites: []
-  };
+  // Load resources metadata
+  const resources = await loadResourcesMetadata(orchid);
 
-  // Add custom videos (prioritized)
-  orchid.customVideos.forEach(url => {
-    resources.videos.push({
-      url: url,
-      title: `${orchid.name} Care Video`
-    });
-  });
-
-  // Add custom websites (prioritized)
-  orchid.customWebsites.forEach(url => {
-    resources.websites.push({
-      url: url,
-      title: `${orchid.name} Care Guide`
-    });
-  });
-
-  // Generate search suggestions for finding more resources
-  const searchQueries = generateSearchQueries(orchid);
-  console.log(`  Suggested video searches: ${searchQueries.videos.join(', ')}`);
-  console.log(`  Suggested website searches: ${searchQueries.websites.join(', ')}`);
-
-  // Add some default reliable resources if no custom ones provided
-  if (resources.websites.length === 0) {
-    resources.websites.push({
-      url: 'https://www.aos.org/orchids/orchid-care.aspx',
-      title: 'American Orchid Society - General Care Guide'
-    });
+  // Merge sources into resources
+  for (const source of sources) {
+    if (source.type === 'youtube' && !resources.videos.find(v => v.url === source.url)) {
+      resources.videos.push({ url: source.url, title: source.title });
+    } else if (source.type === 'website' && !resources.websites.find(w => w.url === source.url)) {
+      resources.websites.push({ url: source.url, title: source.title });
+    }
   }
 
   // Create the final data structure
@@ -231,7 +359,8 @@ async function processOrchid(orchid) {
     description: orchid.description || `${orchid.name} is a beautiful orchid species that requires proper care to thrive.`,
     care: careInfo,
     resources: resources,
-    searchQueries: searchQueries // Include for manual searching
+    generatedAt: new Date().toISOString(),
+    generatedWith: 'RAG (Qdrant + Ollama)'
   };
 
   // Save to file
@@ -246,64 +375,42 @@ async function processOrchid(orchid) {
  * Main function
  */
 async function main() {
-  console.log('=== Orchid Care Guide Content Generator ===\n');
+  console.log('=== Orchid Care Guide Content Generator (RAG) ===\n');
 
-  // Check if Ollama is available
-  console.log('Checking Ollama connection...');
   try {
-    const response = await fetch(`${OLLAMA_BASE_URL}/api/tags`);
-    if (response.ok) {
-      const data = await response.json();
-      const models = data.models || [];
-      console.log(`✓ Connected to Ollama (${models.length} models available)`);
+    // Initialize
+    await initialize();
 
-      const hasModel = models.some(m => m.name.includes(OLLAMA_MODEL.split(':')[0]));
-      if (!hasModel) {
-        console.warn(`⚠ Model '${OLLAMA_MODEL}' not found. Available models:`, models.map(m => m.name).join(', '));
-        console.warn(`  You can pull a model with: ollama pull ${OLLAMA_MODEL}`);
-      }
-    } else {
-      throw new Error('Ollama not responding');
+    // Create output directory
+    await fs.mkdir(OUTPUT_DIR, { recursive: true });
+
+    // Parse orchids list
+    console.log('\nReading orchids list...');
+    const orchids = await parseOrchidsList();
+    console.log(`Found ${orchids.length} orchid species\n`);
+
+    // Process each orchid
+    const results = [];
+    for (const orchid of orchids) {
+      const result = await processOrchid(orchid);
+      results.push(result);
+
+      // Small delay
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
+
+    console.log('\n=== Summary ===');
+    console.log(`✓ Generated care guides for ${results.length} orchid species`);
+    console.log(`✓ Files saved to: ${OUTPUT_DIR}`);
+    console.log('\nNext steps:');
+    console.log('1. Review the generated files in data/orchids/');
+    console.log('2. Run the Next.js app: npm run dev');
+    console.log('3. Build for production: npm run build');
   } catch (error) {
-    console.error('✗ Could not connect to Ollama');
-    console.error('  Make sure Ollama is running: ollama serve');
-    console.error('  Or set OLLAMA_BASE_URL environment variable');
-    console.error(`  Error: ${error.message}\n`);
-    console.log('Continuing anyway (will use fallback data)...\n');
+    console.error('\n=== Error ===');
+    console.error(error.message);
+    process.exit(1);
   }
-
-  // Create output directory if it doesn't exist
-  await fs.mkdir(OUTPUT_DIR, { recursive: true });
-
-  // Parse orchids list
-  console.log('Reading orchids list...');
-  const orchids = await parseOrchidsList();
-  console.log(`Found ${orchids.length} orchid species\n`);
-
-  // Process each orchid
-  const results = [];
-  for (const orchid of orchids) {
-    const result = await processOrchid(orchid);
-    results.push(result);
-
-    // Small delay to avoid overwhelming Ollama
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-
-  console.log('\n=== Summary ===');
-  console.log(`✓ Generated care guides for ${results.length} orchid species`);
-  console.log(`✓ Files saved to: ${OUTPUT_DIR}`);
-  console.log('\nNext steps:');
-  console.log('1. Review the generated files in data/orchids/');
-  console.log('2. Add custom YouTube videos and websites to data/orchids-list.md');
-  console.log('3. Re-run this script to update with custom resources');
-  console.log('4. Run the Next.js app: npm run dev');
 }
 
-// Run the script
-main().catch(error => {
-  console.error('\n=== Error ===');
-  console.error(error);
-  process.exit(1);
-});
+main();
